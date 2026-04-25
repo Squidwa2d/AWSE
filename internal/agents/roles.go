@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/aswe/aswe/internal/adapter"
 	"github.com/aswe/aswe/internal/state"
@@ -110,14 +111,26 @@ func (a *PlanAgent) Run(ctx context.Context, in *RunInput) (*RunOutput, error) {
 `, in.PlanFeedback)
 	}
 
-	// 增量修复指引: 让模型基于上一轮 plan.md 做最小化定向修改, 而不是整篇重写.
+	// 上一轮 plan.md 仅作"参考资料"喂给模型, 但 ASWE 的写盘逻辑是**全量覆盖**:
+	// 这一轮 stdout = 新 plan.md 的全部内容, 没有任何 diff / patch 合并。
+	// 所以这里**不能**说"做最小化修改", 否则模型会只回 changelog, 落盘后 plan.md
+	// 只剩几行说明, YAML 块整段消失, 校验立刻失败 (经验事故案例).
 	prevPlanSection := ""
 	if strings.TrimSpace(prevPlan) != "" {
 		prevPlanSection = fmt.Sprintf(`
-【上一轮你自己产出的 plan.md, 本轮请基于它做"最小化定向修改"——不要整篇重写, 不要丢掉已正确的内容】
+【上一轮你自己产出的 plan.md (仅作参考, 帮助你"复用已正确部分 + 定位需要改的地方")】
 ----
 %s
 ----
+**关键约束 — 必读**:
+- ASWE 写盘是**全量覆盖**: 本轮 stdout 完整内容会原样替换 plan.md, 没有 diff 合并.
+- 因此本轮 stdout 必须输出**完整、独立可读**的新 plan.md 全文,
+  包含全部章节 (## 总体思路 / ## 技术选型 / ## 模块拆分 / ## 关键接口 /
+  ## 实施步骤 / ## 风险与权衡 / ## 需要人类批准的事项), 以及末尾的
+  # aswe-plan-modules YAML 块.
+- **严禁**只输出 "我改了什么 / 已修复 X" 这种 changelog 风格的总结 ——
+  那样会让 plan.md 被你这段总结整体替换, 上一轮的内容全部丢失.
+- 沿用上一轮已正确的内容直接复制粘贴即可, 不会被罚, 但**不能省略**.
 `, prevPlan)
 	}
 
@@ -176,8 +189,17 @@ spec:
 	if rescued, ok := rescueArtifactByMarker(in, out.OutputPath, "plan.md", raw, "# aswe-plan-modules"); ok {
 		raw = rescued
 	}
-	if _, err := state.ExtractPlanModules(raw); err != nil {
-		repairPrompt := withSafety(in.ProjectDir, safetyRulesForReader, buildPlanRepairPrompt(raw, err))
+	// 双层校验: 先用 looksLikePartialPlan 粗筛"AI 偷懒只回 diff/changelog"的典型反例,
+	// 给出比 YAML 解析错更直观的原因; 再用 state.ExtractPlanModules 严格校验 YAML.
+	// 任一失败都进入 repair 轮, 重发 prompt 让模型重新输出完整 plan.md.
+	var repairReason error
+	if reason, ok := looksLikePartialPlan(raw); !ok {
+		repairReason = fmt.Errorf("%s", reason)
+	} else if _, err := state.ExtractPlanModules(raw); err != nil {
+		repairReason = err
+	}
+	if repairReason != nil {
+		repairPrompt := withSafety(in.ProjectDir, safetyRulesForReader, buildPlanRepairPrompt(raw, repairReason))
 		out, raw, err = a.invokeWith(ctx, in, repairPrompt, in.WorkspaceDir, 600)
 		if err != nil {
 			return nil, err
@@ -192,8 +214,51 @@ spec:
 	return out, nil
 }
 
+// looksLikePartialPlan 在严格 YAML 解析(ExtractPlanModules)之前粗筛 stdout 是否
+// 明显不是一份"完整 plan.md", 而只是模型偷懒回的 changelog/diff 摘要.
+//
+// 触发条件 (任一命中视为可疑):
+//  1. 长度 < 600 个 rune (一份合规 plan.md 通常 1500+);
+//  2. 缺少 "## 模块拆分" 或 "## 实施步骤" 这两个核心章节;
+//  3. 缺少 "# aswe-plan-modules" 机器可读标识行.
+//
+// 这一层的存在是为了让 repair 轮的 prompt 能针对"你只回了 diff"这种症状下药,
+// 而不是单纯报"YAML 解析失败" — 后者会让 AI 误以为只是 YAML 写错, 继续偷懒.
+func looksLikePartialPlan(raw string) (string, bool) {
+	body := strings.TrimSpace(raw)
+	if n := utf8.RuneCountInString(body); n < 600 {
+		return fmt.Sprintf("plan.md 长度仅 %d 字, 远低于完整方案的最低规模(≥600), 疑似只输出了 changelog/摘要", n), false
+	}
+	required := []string{"## 模块拆分", "## 实施步骤"}
+	var missing []string
+	for _, h := range required {
+		if !strings.Contains(body, h) {
+			missing = append(missing, h)
+		}
+	}
+	if len(missing) > 0 {
+		return "plan.md 缺少关键章节: " + strings.Join(missing, ", "), false
+	}
+	if !strings.Contains(body, "# aswe-plan-modules") {
+		return "plan.md 缺少 '# aswe-plan-modules' 标识行 (机器可读 YAML 块未输出)", false
+	}
+	return "", true
+}
+
 func buildPlanRepairPrompt(plan string, reason error) string {
 	fence := "```"
+	planRunes := utf8.RuneCountInString(strings.TrimSpace(plan))
+	// 当原文本身只有几百字时, 它大概率就是 changelog/摘要; prompt 里要明确告诉模型
+	// "原文不是真正的 plan.md, 不要在它基础上修补, 必须从 spec 重新长出完整方案".
+	suspectChangelog := ""
+	if planRunes < 600 {
+		suspectChangelog = fmt.Sprintf(`
+
+**⚠️ 注意: 上面的"原始 plan.md"长度仅 %d 字, 几乎可以确定它**不是**一份完整方案,
+而是上一轮 Plan-Agent 偷懒只回了一段"我改了什么"的 changelog/摘要,
+然后被 ASWE 当作 plan.md 整体落盘. 你这一轮**不要**在它基础上"修补",
+请回到 spec 重新写一份完整、独立可读的 plan.md.**`, planRunes)
+	}
 	return fmt.Sprintf(`你是 Plan-Agent. 下面这份 plan.md 未通过机器校验, 原因是:
 %v
 
@@ -202,12 +267,14 @@ func buildPlanRepairPrompt(plan string, reason error) string {
 原始 plan.md:
 ----
 %s
-----
+----%s
 
 强制要求:
 1. 只输出完整 markdown, 不要解释, 不要在全文外包裹代码围栏.
-2. 末尾必须包含 "## 模块与单元拆分 (机器可读)".
-3. 该章节下面必须且只能有一个 yaml fenced code block, 格式必须如下:
+2. **必须包含全部章节** (## 总体思路 / ## 技术选型 / ## 模块拆分 / ## 关键接口 /
+   ## 实施步骤 / ## 风险与权衡 / ## 需要人类批准的事项), 任一章节缺失都会再次被打回.
+3. 末尾必须包含 "## 模块与单元拆分 (机器可读)".
+4. 该章节下面必须且只能有一个 yaml fenced code block, 格式必须如下:
 
 %syaml
 # aswe-plan-modules
@@ -222,9 +289,11 @@ modules:
         deliverable: 可验证交付物
 %s
 
-4. 每个 module 必须有 id/title/units; 每个 unit 必须有 id/title/scope/deliverable.
-5. id 必须全局唯一; 每个模块至少一个 unit.
-6. 最后一行仍然输出: VERDICT: PASS`, reason, plan, fence, fence)
+5. 每个 module 必须有 id/title/units; 每个 unit 必须有 id/title/scope/deliverable.
+6. id 必须全局唯一; 每个模块至少一个 unit.
+7. **严禁**只输出 "我改了什么" / "已修复 X" 这种 changelog —— ASWE 写盘是全量覆盖,
+   只回 changelog 会让 plan.md 仅剩你这段总结, 整篇方案被抹掉.
+8. 最后一行仍然输出: VERDICT: PASS`, reason, plan, suspectChangelog, fence, fence)
 }
 
 // ==================================================================
