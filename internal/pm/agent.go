@@ -241,10 +241,15 @@ func (a *Agent) confirm(prompt string) (bool, error) {
 			fmt.Fprintln(a.out, "(手动编辑暂未实现, 默认接受)")
 			return true, nil
 		}
+		// stdin 关闭(EOF) 且没有有效输入: 必须退出, 否则会无限循环.
+		if err == io.EOF {
+			return false, fmt.Errorf("PM-Agent confirm 等待用户输入时遭遇 EOF (非交互环境?)")
+		}
 	}
 }
 
 // makeChangeID 根据标题生成 kebab-case id.
+// 注意按 rune 截断, 否则 60 字节切到中文中段会产出非法 UTF-8 (像 "\xe4\xb8" 这种残半字符).
 func makeChangeID(title string) string {
 	t := strings.ToLower(title)
 	re := regexp.MustCompile(`[^a-z0-9\p{Han}]+`)
@@ -253,13 +258,12 @@ func makeChangeID(title string) string {
 	if t == "" {
 		t = "proposal"
 	}
-	if len(t) > 60 {
-		t = t[:60]
-	}
+	t = truncateRunes(t, 60)
 	return fmt.Sprintf("%s-%s", t, time.Now().Format("0102-150405"))
 }
 
 // extractTitle 尝试从 markdown 里抓 H1, 抓不到就用原始需求.
+// 同样按 rune 截断, 避免中文标题被切成乱码.
 func extractTitle(fallback, md string) string {
 	for _, line := range strings.Split(md, "\n") {
 		line = strings.TrimSpace(line)
@@ -267,17 +271,28 @@ func extractTitle(fallback, md string) string {
 			return strings.TrimSpace(strings.TrimPrefix(line, "# "))
 		}
 	}
-	if len(fallback) > 50 {
-		return fallback[:50]
+	return truncateRunes(fallback, 50)
+}
+
+// truncateRunes 按 unicode 字符数截断, 避免中英混合字符串切到多字节字符的中段.
+func truncateRunes(s string, n int) string {
+	if n <= 0 {
+		return ""
 	}
-	return fallback
+	rs := []rune(s)
+	if len(rs) <= n {
+		return s
+	}
+	return string(rs[:n])
 }
 
 // extractMarkdown 如果模型返回里包了 ```markdown ... ```, 抽出里面的内容.
+// extractMarkdown 从模型回复中抽出 ```markdown ... ``` 围栏块.
+// 兼容: 不带语言标识的 ```; 围栏行尾可能是 \r\n; 围栏内没有内容时退化为整段原文.
 func extractMarkdown(s string) string {
-	re := regexp.MustCompile("(?s)```(?:markdown|md)?\\n(.*?)```")
+	re := regexp.MustCompile("(?s)```(?:markdown|md)?[ \\t]*\\r?\\n(.*?)```")
 	m := re.FindStringSubmatch(s)
-	if len(m) >= 2 {
+	if len(m) >= 2 && strings.TrimSpace(m[1]) != "" {
 		return strings.TrimSpace(m[1])
 	}
 	return strings.TrimSpace(s)

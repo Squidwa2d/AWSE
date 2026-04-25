@@ -114,6 +114,50 @@ func readIfExists(p string) string {
 	return string(data)
 }
 
+// rescueArtifactByMarker 在 stdout 落盘的 artifact 缺失关键 marker 时,
+// 扫描"AI 可能自己用 Write 工具落盘的"几个候选路径(workspaceDir / projectDir 及其
+// <change-id>/<file> 等), 若其中某份文件含有 marker, 就把它的内容覆盖回 outPath
+// 并返回 (rescuedContent, true). 否则返回原 raw + false.
+//
+// 这是一个针对"agentic CLI 把内容用 Write 写到磁盘, 而 stdout 只回了简短摘要"
+// 这类失配场景的兜底, 让机器校验不会因为读到的副本没内容就误判失败.
+func rescueArtifactByMarker(in *RunInput, outPath, fileName, raw, marker string) (string, bool) {
+	if marker == "" || strings.Contains(raw, marker) {
+		return raw, false
+	}
+	candidates := []string{
+		// AI 可能在 cwd (workspaceDir) 直接写
+		filepath.Join(in.WorkspaceDir, fileName),
+		// 或在 ProjectDir 写
+		filepath.Join(in.ProjectDir, fileName),
+		// 或在 ChangeDir 写
+		filepath.Join(in.ChangeDir, fileName),
+	}
+	if in.ChangeID != "" {
+		// 也可能写到 <workspace>/<change-id>/<file>
+		candidates = append(candidates,
+			filepath.Join(in.WorkspaceDir, in.ChangeID, fileName))
+	}
+	for _, p := range candidates {
+		if p == "" || p == outPath {
+			continue
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		s := string(data)
+		if !strings.Contains(s, marker) {
+			continue
+		}
+		// 找到含 marker 的副本: 覆盖回 outPath, 让后续校验/读取都能命中.
+		header := fmt.Sprintf("<!-- rescued from %s by aswe at %s -->\n\n", p, time.Now().Format(time.RFC3339))
+		_ = os.WriteFile(outPath, []byte(header+s+"\n"), 0o644)
+		return s, true
+	}
+	return raw, false
+}
+
 // parseVerdict 从 AI 输出中解析 PASS/FAIL.
 // 解析规则(健壮版):
 //  1. 从后往前扫描**所有行**, 找到第一条包含 "VERDICT:" 的行, 根据其中是否出现 PASS/FAIL 判定.

@@ -54,6 +54,27 @@ func TestExtractPlanModules_ToleratesFenceVariants(t *testing.T) {
 	}
 }
 
+func TestExtractPlanModules_LooseMarkerWithoutFence(t *testing.T) {
+	md := `## 模块与单元拆分 (机器可读)
+
+# aswe-plan-modules
+modules:
+  - id: A
+    title: 数据模型
+    units:
+      - id: A.1
+        title: 定义 Todo
+
+VERDICT: PASS`
+	mods, err := ExtractPlanModules(md)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if len(mods) != 1 || mods[0].ID != "A" || len(mods[0].Units) != 1 {
+		t.Fatalf("unexpected modules: %+v", mods)
+	}
+}
+
 func TestExtractPlanModules_NoMarker(t *testing.T) {
 	md := "```yaml\nfoo: bar\n```"
 	_, err := ExtractPlanModules(md)

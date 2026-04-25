@@ -101,9 +101,6 @@ func ExtractPlanModules(planMarkdown string) ([]*Module, error) {
 // 返回去除标识行后的纯 YAML 文本.
 func findPlanYAMLBlock(md string) (string, error) {
 	matches := codeBlockRE.FindAllStringSubmatch(md, -1)
-	if len(matches) == 0 {
-		return "", fmt.Errorf("plan.md 中未找到 YAML 代码块")
-	}
 	for _, m := range matches {
 		body := m[2]
 		trim := strings.TrimLeft(body, " \t\r\n")
@@ -118,5 +115,34 @@ func findPlanYAMLBlock(md string) (string, error) {
 			return trim[firstLineEnd+1:], nil
 		}
 	}
+	if block := findLoosePlanYAMLBlock(md); block != "" {
+		return block, nil
+	}
+	if len(matches) == 0 {
+		return "", fmt.Errorf("plan.md 中未找到 YAML 代码块")
+	}
 	return "", fmt.Errorf("plan.md 中未找到以 '# %s' 开头的 YAML 代码块", planYAMLMarker)
+}
+
+// findLoosePlanYAMLBlock 兼容模型漏写 fenced code block、但保留了 marker 的输出。
+// 从 marker 下一行开始收集 YAML, 遇到下一个 markdown 标题或 VERDICT 即停止。
+func findLoosePlanYAMLBlock(md string) string {
+	lines := strings.Split(md, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "#") || !strings.Contains(trimmed, planYAMLMarker) {
+			continue
+		}
+		var block []string
+		for _, next := range lines[i+1:] {
+			t := strings.TrimSpace(next)
+			upper := strings.ToUpper(t)
+			if strings.HasPrefix(t, "## ") || strings.HasPrefix(upper, "VERDICT:") {
+				break
+			}
+			block = append(block, next)
+		}
+		return strings.TrimSpace(strings.Join(block, "\n"))
+	}
+	return ""
 }

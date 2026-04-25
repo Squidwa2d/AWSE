@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -161,6 +162,32 @@ func (o *Orchestrator) Run(ctx context.Context, changeDir, proposalPath string) 
 		return fmt.Errorf("create artifact dir: %w", err)
 	}
 
+	// resume 兜底: 上次跑挂在 failed 时, PlanIteration / CodeIteration 通常已贴上限,
+	// 直接续跑会被 transition() 立即判定 "loop budget exceeded" 而再次 failed,
+	// 用户感觉 "我什么都没做就又挂了". 这里把 stage 拉回非 failed, 同时把已贴顶的
+	// 计数器降一档, 让用户能借助本次修改至少多跑两轮再决定.
+	if st.CurrentStage == state.StageFailed {
+		st.CurrentStage = state.StagePlan
+		fmt.Fprintln(o.out, "ℹ️  上次以 failed 收尾, 自动从 plan 阶段续跑")
+	}
+	if st.PlanIteration >= o.maxPlanLoops {
+		newIter := o.maxPlanLoops - 2
+		if newIter < 0 {
+			newIter = 0
+		}
+		fmt.Fprintf(o.out, "ℹ️  PlanIteration=%d 已到上限, 续跑前降到 %d\n", st.PlanIteration, newIter)
+		st.PlanIteration = newIter
+	}
+	if st.CodeIteration >= o.maxCodeLoops {
+		newIter := o.maxCodeLoops - 2
+		if newIter < 0 {
+			newIter = 0
+		}
+		fmt.Fprintf(o.out, "ℹ️  CodeIteration=%d 已到上限, 续跑前降到 %d\n", st.CodeIteration, newIter)
+		st.CodeIteration = newIter
+	}
+	_ = o.store.Save()
+
 	for st.CurrentStage != state.StageDone && st.CurrentStage != state.StageFailed {
 		stage := st.CurrentStage
 
@@ -269,6 +296,9 @@ func (o *Orchestrator) Run(ctx context.Context, changeDir, proposalPath string) 
 		// 决定下一个节点 (含循环回跳与超限判断)
 		st.CurrentStage = o.transition(st, stage, out, changeDir)
 		_ = o.store.Save()
+		// 每步都刷一次 tasks.md, 让人在线性路径下也能 cat 它看进度.
+		// (模块化路径自己也会刷, 这里多刷一次无副作用.)
+		_ = state.WriteTasksMD(o.artifactDir, st)
 	}
 
 	if st.CurrentStage == state.StageFailed {
@@ -292,7 +322,10 @@ func (o *Orchestrator) transition(st *state.State, cur state.Stage, out *agents.
 	switch cur {
 	case state.StagePlanReview:
 		// 机器侧强校验: YAML 必须存在且合法, 否则不管 AI 怎么说都视为 FAIL.
-		planMD := readPlanOutput(st.ProjectDir, o.artifactDir, changeDir)
+		// 同时挂上 rescue: 若 artifact 里的 plan.md 缺关键 YAML 标记,
+		// 扫几个 AI 可能用 Write 落盘的候选位置(workspace/projectDir/changeDir 等)
+		// 找一份含标记的覆盖回去, 然后再校验.
+		planMD := readPlanWithRescue(o.artifactDir, st.ProjectDir, changeDir, st.WorkspaceDir, st.ChangeID, o.out)
 		yamlErr := validatePlanModules(planMD)
 		// 最小轮数兜底: 第一轮(PlanIteration=0) 总算已完成 1 轮, 若 minPlanLoops=2
 		// 则仅完成轮数 < 2 时要强制再跑; 仅在 AI 已判 PASS 且机校通过时才生效,
@@ -418,7 +451,7 @@ func (o *Orchestrator) askBefore(stage state.Stage) (bool, error) {
 	for {
 		fmt.Fprint(o.out, prompt)
 		line, err := o.in.ReadString('\n')
-		if err != nil {
+		if err != nil && err != io.EOF {
 			return false, err
 		}
 		ans := strings.ToLower(strings.TrimSpace(line))
@@ -429,6 +462,10 @@ func (o *Orchestrator) askBefore(stage state.Stage) (bool, error) {
 			return true, nil
 		case "q", "quit":
 			return false, fmt.Errorf("user aborted at stage %s", stage)
+		}
+		// stdin 关闭 (EOF) 且没有有效输入 -> 退出, 避免在 CI / 管道场景死循环.
+		if err == io.EOF {
+			return false, fmt.Errorf("orchestrator askBefore stage=%s 遭遇 EOF (非交互环境? 请用 --mode auto)", stage)
 		}
 	}
 }
@@ -465,20 +502,48 @@ func readNodeOutputAt(artifactDir string, s state.Stage, fallbackDirs ...string)
 	return ""
 }
 
-func readPlanOutput(projectDir, artifactDir string, fallbackDirs ...string) string {
-	if data := readFileAt(projectDir, "plan.md"); data != "" {
-		return data
+// readPlanWithRescue 是 readNodeOutputAt(StagePlan) 的兜底加强版:
+// 优先读 artifactDir/plan.md; 若该文件不含 "# aswe-plan-modules" marker,
+// 就到 AI 可能 Write 落盘的几个候选路径(projectDir / changeDir / workspaceDir /
+// workspaceDir/<change-id>/) 找一份带 marker 的覆盖回去, 后续校验/解析才能命中.
+//
+// 任何一个候选成功了, 都会把内容写回 artifactDir/plan.md 加注 rescue 头, 让用户
+// 在 artifact 目录就能看到完整内容, 不必再去 projects 目录里翻.
+func readPlanWithRescue(artifactDir, projectDir, changeDir, workspaceDir, changeID string, log io.Writer) string {
+	const marker = "# aswe-plan-modules"
+	primary := readNodeOutputAt(artifactDir, state.StagePlan, changeDir)
+	if strings.Contains(primary, marker) {
+		return primary
 	}
-	return readNodeOutputAt(artifactDir, state.StagePlan, fallbackDirs...)
-}
-
-func readFileAt(dir, name string) string {
-	if dir == "" || name == "" {
-		return ""
+	candidates := []string{
+		filepath.Join(projectDir, "plan.md"),
+		filepath.Join(changeDir, "plan.md"),
+		filepath.Join(workspaceDir, "plan.md"),
 	}
-	data, err := os.ReadFile(dir + string(os.PathSeparator) + name)
-	if err != nil {
-		return ""
+	if changeID != "" {
+		candidates = append(candidates, filepath.Join(workspaceDir, changeID, "plan.md"))
 	}
-	return string(data)
+	for _, p := range candidates {
+		if p == "" || p == filepath.Join(artifactDir, "plan.md") {
+			continue
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		s := string(data)
+		if !strings.Contains(s, marker) {
+			continue
+		}
+		// 写回 artifactDir/plan.md, 加上 rescue 头
+		out := filepath.Join(artifactDir, "plan.md")
+		header := fmt.Sprintf("<!-- rescued from %s by aswe orchestrator at %s -->\n\n",
+			p, time.Now().Format(time.RFC3339))
+		_ = os.WriteFile(out, []byte(header+s+"\n"), 0o644)
+		if log != nil {
+			fmt.Fprintf(log, "🛟 plan.md rescued: artifactDir 缺 YAML, 已从 %s 拷回\n", p)
+		}
+		return s
+	}
+	return primary
 }

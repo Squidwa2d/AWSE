@@ -36,9 +36,15 @@ func (a *ClaudeCodeAdapter) Invoke(ctx context.Context, req Request) (*Response,
 	if len(req.ExtraArgs) > 0 {
 		args = append(args, req.ExtraArgs...)
 	}
-	args = append(args, req.Prompt)
+	// 大 prompt 切 stdin, 防止超 ARG_MAX.
+	stdinPayload := ""
+	if len(req.Prompt) > maxArgvPromptBytes {
+		stdinPayload = req.Prompt
+	} else {
+		args = append(args, req.Prompt)
+	}
 
-	stdout, stderr, exit, err := runCommand(ctx, req.WorkDir, req.TimeoutSeconds, "", a.Binary, args...)
+	stdout, stderr, exit, err := runCommand(ctx, req.WorkDir, req.TimeoutSeconds, stdinPayload, a.Binary, args...)
 	if err != nil && exit == 0 {
 		return nil, fmt.Errorf("claude invoke failed: %w (stderr=%s)", err, stderr)
 	}

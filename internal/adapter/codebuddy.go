@@ -43,10 +43,16 @@ func (a *CodeBuddyAdapter) Invoke(ctx context.Context, req Request) (*Response, 
 	if len(req.ExtraArgs) > 0 {
 		args = append(args, req.ExtraArgs...)
 	}
-	// prompt 通过位置参数传入(其 CLI 约定): codebuddy ... "PROMPT"
-	args = append(args, req.Prompt)
+	// 短 prompt 走 argv (CLI 原生约定: codebuddy ... "PROMPT");
+	// 超阈值时切 stdin, 避免触发 "argument list too long" 直接崩溃.
+	stdinPayload := ""
+	if len(req.Prompt) > maxArgvPromptBytes {
+		stdinPayload = req.Prompt
+	} else {
+		args = append(args, req.Prompt)
+	}
 
-	stdout, stderr, exit, err := runCommand(ctx, req.WorkDir, req.TimeoutSeconds, "", bin, args...)
+	stdout, stderr, exit, err := runCommand(ctx, req.WorkDir, req.TimeoutSeconds, stdinPayload, bin, args...)
 	if err != nil && exit == 0 {
 		return nil, fmt.Errorf("codebuddy invoke failed: %w (stderr=%s)", err, stderr)
 	}

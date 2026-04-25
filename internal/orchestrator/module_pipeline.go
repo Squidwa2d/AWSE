@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/aswe/aswe/internal/agents"
@@ -35,7 +37,7 @@ func (o *Orchestrator) runModulePipeline(ctx context.Context, changeDir, artifac
 	// 正常路径下此处必能解析成功. 真的失败通常意味着 state 被外部改过,
 	// 此时直接返回 error 交给人工处理, 而不是静默降级到线性流水线.
 	if len(st.Modules) == 0 {
-		planMD := readPlanOutput(st.ProjectDir, artifactDir, changeDir)
+		planMD := readPlanWithRescue(artifactDir, st.ProjectDir, changeDir, st.WorkspaceDir, st.ChangeID, o.out)
 		mods, err := state.ExtractPlanModules(planMD)
 		if err != nil {
 			fmt.Fprintf(o.out, "🛑 plan.md 未通过机器校验 (%v); Plan-Review 的兜底校验可能被绕过, 请重跑 plan 阶段.\n", err)
@@ -49,11 +51,16 @@ func (o *Orchestrator) runModulePipeline(ctx context.Context, changeDir, artifac
 		fmt.Fprintf(o.out, "📦 解析到 %d 个模块, 进入模块化流水线 (每单元最多 %d 轮)\n",
 			len(mods), st.MaxUnitLoops)
 		o.printModuleOverview(st)
+	} else {
+		// resume 场景: state 里已有模块, 同样打印一次概览, 让用户立刻看到进度.
+		fmt.Fprintf(o.out, "📦 续跑模块化流水线: 已有 %d 个模块 (每单元最多 %d 轮)\n",
+			len(st.Modules), st.MaxUnitLoops)
+		o.printModuleOverview(st)
 	}
 
 	// 进入模块循环, 逐模块完成
 	spec := readNodeOutputAt(artifactDir, state.StageSpec, changeDir)
-	plan := readPlanOutput(st.ProjectDir, artifactDir, changeDir)
+	plan := readPlanWithRescue(artifactDir, st.ProjectDir, changeDir, st.WorkspaceDir, st.ChangeID, o.out)
 
 	for {
 		st = o.store.State()
@@ -162,12 +169,16 @@ func (o *Orchestrator) runOneUnitStep(
 		_ = o.store.Save()
 		fmt.Fprintf(o.out, "\n▶ [Dev]    module=%s unit=%s iter=%d/%d\n",
 			mod.ID, u.ID, u.Iteration, maxLoops)
+		_ = o.store.Emit(state.Event{Stage: state.StageDev, Type: "unit-start",
+			Module: mod.ID, Unit: u.ID, Iteration: u.Iteration})
 
 		out, err := ua.dev.RunUnit(ctx, in)
 		if err != nil {
 			u.Status = state.UnitFailed
 			u.LastError = err.Error()
 			u.UpdatedAt = time.Now()
+			_ = o.store.Emit(state.Event{Stage: state.StageDev, Type: "unit-failed",
+				Module: mod.ID, Unit: u.ID, Iteration: u.Iteration, Message: err.Error()})
 			return fmt.Errorf("dev unit %s: %w", u.ID, err)
 		}
 		u.DevFile = out.OutputPath
@@ -178,10 +189,16 @@ func (o *Orchestrator) runOneUnitStep(
 			u.LastFeedback = "Dev 自报 VERDICT: FAIL — " + out.Summary
 			u.Iteration++
 			fmt.Fprintf(o.out, "⚠️  单元 %s Dev 自报失败, 下轮继续修复\n", u.ID)
+			_ = o.store.Emit(state.Event{Stage: state.StageDev, Type: "unit-end",
+				Module: mod.ID, Unit: u.ID, Iteration: u.Iteration - 1,
+				Message: "passed=false (self-fail)"})
 			return nil
 		}
 		u.Status = state.UnitDevDone
 		fmt.Fprintf(o.out, "✅ 单元 %s Dev 完成 (adapter=%s)\n", u.ID, out.Adapter)
+		_ = o.store.Emit(state.Event{Stage: state.StageDev, Type: "unit-end",
+			Module: mod.ID, Unit: u.ID, Iteration: u.Iteration,
+			Message: fmt.Sprintf("passed=true adapter=%s", out.Adapter)})
 		return nil
 
 	case state.UnitDevDone:
@@ -190,12 +207,16 @@ func (o *Orchestrator) runOneUnitStep(
 		_ = o.store.Save()
 		fmt.Fprintf(o.out, "\n▶ [Review] module=%s unit=%s iter=%d/%d\n",
 			mod.ID, u.ID, u.Iteration, maxLoops)
+		_ = o.store.Emit(state.Event{Stage: state.StageReview, Type: "unit-start",
+			Module: mod.ID, Unit: u.ID, Iteration: u.Iteration})
 
 		out, err := ua.review.RunUnit(ctx, in)
 		if err != nil {
 			u.Status = state.UnitFailed
 			u.LastError = err.Error()
 			u.UpdatedAt = time.Now()
+			_ = o.store.Emit(state.Event{Stage: state.StageReview, Type: "unit-failed",
+				Module: mod.ID, Unit: u.ID, Iteration: u.Iteration, Message: err.Error()})
 			return fmt.Errorf("review unit %s: %w", u.ID, err)
 		}
 		u.ReviewFile = out.OutputPath
@@ -208,15 +229,24 @@ func (o *Orchestrator) runOneUnitStep(
 				return nil
 			}
 			u.Status = state.UnitReviewFailed
-			u.LastFeedback = readArtifact(artifactDir, changeDir, u.ID, "review.md")
+			// 只把"## 给 Dev 的反馈"section 留下来; 整张 review.md 太长,
+			// 会把 Dev 的下一轮 prompt 塞满 spec/plan/树形结构等噪声.
+			u.LastFeedback = agents.ExtractFeedbackSection(
+				readArtifact(artifactDir, changeDir, u.ID, "review.md"),
+				"给 Dev 的反馈",
+			)
 			u.Iteration++
 			fmt.Fprintf(o.out, "🔁 单元 %s Review 打回, 回到 dev (下轮 iter=%d)\n",
 				u.ID, u.Iteration)
+			_ = o.store.Emit(state.Event{Stage: state.StageReview, Type: "unit-end",
+				Module: mod.ID, Unit: u.ID, Iteration: u.Iteration - 1, Message: "passed=false"})
 			return nil
 		}
 		u.Status = state.UnitReviewPassed
 		u.LastFeedback = ""
 		fmt.Fprintf(o.out, "✅ 单元 %s Review 通过\n", u.ID)
+		_ = o.store.Emit(state.Event{Stage: state.StageReview, Type: "unit-end",
+			Module: mod.ID, Unit: u.ID, Iteration: u.Iteration, Message: "passed=true"})
 		return nil
 
 	case state.UnitReviewPassed:
@@ -225,12 +255,16 @@ func (o *Orchestrator) runOneUnitStep(
 		_ = o.store.Save()
 		fmt.Fprintf(o.out, "\n▶ [Test]   module=%s unit=%s iter=%d/%d\n",
 			mod.ID, u.ID, u.Iteration, maxLoops)
+		_ = o.store.Emit(state.Event{Stage: state.StageTest, Type: "unit-start",
+			Module: mod.ID, Unit: u.ID, Iteration: u.Iteration})
 
 		out, err := ua.test.RunUnit(ctx, in)
 		if err != nil {
 			u.Status = state.UnitFailed
 			u.LastError = err.Error()
 			u.UpdatedAt = time.Now()
+			_ = o.store.Emit(state.Event{Stage: state.StageTest, Type: "unit-failed",
+				Module: mod.ID, Unit: u.ID, Iteration: u.Iteration, Message: err.Error()})
 			return fmt.Errorf("test unit %s: %w", u.ID, err)
 		}
 		u.TestFile = out.OutputPath
@@ -243,22 +277,46 @@ func (o *Orchestrator) runOneUnitStep(
 				return nil
 			}
 			u.Status = state.UnitTestFailed
-			u.LastFeedback = readArtifact(artifactDir, changeDir, u.ID, "test.md")
+			// 同 review: 只留"## 给 Dev 的反馈"以及/或"## 失败详情", 让 prompt 聚焦.
+			testMD := readArtifact(artifactDir, changeDir, u.ID, "test.md")
+			devFb := agents.ExtractFeedbackSection(testMD, "给 Dev 的反馈")
+			failDetail := agents.ExtractFeedbackSection(testMD, "失败详情")
+			combined := strings.TrimSpace(devFb)
+			if failDetail != "" && !strings.Contains(combined, failDetail) {
+				if combined != "" {
+					combined += "\n\n## 失败详情\n" + failDetail
+				} else {
+					combined = "## 失败详情\n" + failDetail
+				}
+			}
+			if combined == "" {
+				combined = testMD
+			}
+			u.LastFeedback = combined
 			u.Iteration++
 			fmt.Fprintf(o.out, "🔁 单元 %s Test 未通过, 回到 dev (下轮 iter=%d)\n",
 				u.ID, u.Iteration)
+			_ = o.store.Emit(state.Event{Stage: state.StageTest, Type: "unit-end",
+				Module: mod.ID, Unit: u.ID, Iteration: u.Iteration - 1, Message: "passed=false"})
 			return nil
 		}
 		u.Status = state.UnitDone
 		u.LastFeedback = ""
 		fmt.Fprintf(o.out, "✅ 单元 %s Test 通过, 标记 DONE\n", u.ID)
+		_ = o.store.Emit(state.Event{Stage: state.StageTest, Type: "unit-end",
+			Module: mod.ID, Unit: u.ID, Iteration: u.Iteration, Message: "passed=true"})
 		return nil
 	}
 
 	return nil
 }
 
+// readArtifact 读取某个单元的产物文件; 非法 unit id 直接返回空串.
+// 严格的合法性校验交给 agents.sanitizeUnitID, 这里只复制其字符集白名单.
 func readArtifact(artifactDir, legacyChangeDir, unitID, name string) string {
+	if !safeUnitIDRE.MatchString(unitID) || strings.Contains(unitID, "..") {
+		return ""
+	}
 	for _, dir := range []string{artifactDir, legacyChangeDir} {
 		if dir == "" {
 			continue
@@ -272,11 +330,26 @@ func readArtifact(artifactDir, legacyChangeDir, unitID, name string) string {
 	return ""
 }
 
+// safeUnitIDRE 与 internal/agents.unitIDRE 保持一致;
+// 在此重复一份以避免该包反向依赖 agents 包.
+var safeUnitIDRE = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
 func (o *Orchestrator) printModuleOverview(st *state.State) {
 	for _, m := range st.Modules {
-		fmt.Fprintf(o.out, "  • 模块 %s: %s (%d 单元)\n", m.ID, m.Title, len(m.Units))
+		done, failed := 0, 0
 		for _, u := range m.Units {
-			fmt.Fprintf(o.out, "      - %s: %s  [scope=%s]\n", u.ID, u.Title, u.Scope)
+			switch u.Status {
+			case state.UnitDone:
+				done++
+			case state.UnitFailed:
+				failed++
+			}
+		}
+		fmt.Fprintf(o.out, "  • 模块 %s [%s]: %s (%d/%d done, %d failed)\n",
+			m.ID, m.Status, m.Title, done, len(m.Units), failed)
+		for _, u := range m.Units {
+			fmt.Fprintf(o.out, "      - %s [%s iter=%d]: %s  [scope=%s]\n",
+				u.ID, u.Status, u.Iteration, u.Title, u.Scope)
 		}
 	}
 }

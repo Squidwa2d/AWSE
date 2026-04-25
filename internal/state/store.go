@@ -114,25 +114,49 @@ type Store struct {
 	state      *State
 }
 
-// Open 打开(或创建) 某个 change 的 store.
+// Open 打开(或创建) 某个 change 的 store. 写入路径(run / status with auto-create)使用.
+// 注意: 调用 Save 前不会真正落盘, 但本函数会预先创建 RunDir, 因此对于"只读查询"
+// 这种不打算写入的场景, 请改用 OpenReadOnly 避免给不存在的 change-id 留下空目录残留.
 func Open(workspaceDir, changeID string) (*Store, error) {
 	runDir := RunDir(workspaceDir, changeID)
 	if err := os.MkdirAll(runDir, 0o755); err != nil {
 		return nil, err
 	}
+	return loadOrInit(workspaceDir, changeID, runDir, true)
+}
+
+// OpenReadOnly 打开一个已存在的 change store. 若 state.json 不存在则报错,
+// 不会像 Open 那样创建空目录, 适用于 status / list 这种纯查询命令.
+func OpenReadOnly(workspaceDir, changeID string) (*Store, error) {
+	runDir := RunDir(workspaceDir, changeID)
+	if _, err := os.Stat(filepath.Join(runDir, "state.json")); err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("change %q 不存在 (找不到 %s)", changeID, runDir)
+		}
+		return nil, err
+	}
+	return loadOrInit(workspaceDir, changeID, runDir, false)
+}
+
+func loadOrInit(workspaceDir, changeID, runDir string, allowInit bool) (*Store, error) {
 	s := &Store{
 		stateFile:  filepath.Join(runDir, "state.json"),
 		eventsFile: filepath.Join(runDir, "events.jsonl"),
 	}
-	if data, err := os.ReadFile(s.stateFile); err == nil {
+	data, err := os.ReadFile(s.stateFile)
+	switch {
+	case err == nil:
 		var st State
 		if err := json.Unmarshal(data, &st); err != nil {
 			return nil, fmt.Errorf("parse state.json: %w", err)
 		}
 		s.state = &st
-	} else if os.IsNotExist(err) {
+	case os.IsNotExist(err):
+		if !allowInit {
+			return nil, fmt.Errorf("state.json 不存在: %s", s.stateFile)
+		}
 		s.state = New(changeID, workspaceDir)
-	} else {
+	default:
 		return nil, err
 	}
 	return s, nil
@@ -158,11 +182,22 @@ func (s *Store) Save() error {
 }
 
 // Event 运行时事件, 追加写入 events.jsonl.
+//
+// 字段含义:
+//   - Stage      : 阶段名 (spec / plan / dev ...). 单元事件也会带上对应的 stage.
+//   - Type       : start / end / done / failed / unit-start / unit-end / unit-failed 等.
+//   - Module     : 单元事件归属的模块 ID (可空).
+//   - Unit       : 单元 ID (可空).
+//   - Iteration  : 单元/计划级循环计数 (可空, 0 表示未填).
+//   - Message    : 自由文本, 用于摘要 / 错误 / passed=...
 type Event struct {
-	Time    time.Time `json:"time"`
-	Stage   Stage     `json:"stage,omitempty"`
-	Type    string    `json:"type"`
-	Message string    `json:"message,omitempty"`
+	Time      time.Time `json:"time"`
+	Stage     Stage     `json:"stage,omitempty"`
+	Type      string    `json:"type"`
+	Module    string    `json:"module,omitempty"`
+	Unit      string    `json:"unit,omitempty"`
+	Iteration int       `json:"iteration,omitempty"`
+	Message   string    `json:"message,omitempty"`
 }
 
 // Emit 追加一条事件.

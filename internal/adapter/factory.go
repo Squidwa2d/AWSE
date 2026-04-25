@@ -20,9 +20,12 @@ func (f *Factory) Build(name, model string) (CLIAdapter, error) {
 	case "codex":
 		return NewCodexAdapter(model), nil
 	case "generic":
+		if strings.TrimSpace(f.GenericCommand) == "" {
+			return nil, fmt.Errorf("adapter=generic 需要在 config.yaml 配置 generic_command (如 \"mycli -p {prompt}\")")
+		}
 		return NewGenericAdapter(f.GenericCommand), nil
 	default:
-		return nil, fmt.Errorf("unknown adapter %q", name)
+		return nil, fmt.Errorf("unknown adapter %q (支持: claude/codebuddy/codex/generic)", name)
 	}
 }
 
@@ -48,8 +51,13 @@ func (f *Factory) Resolve(primary string, fallback []string, model string) (CLIA
 			return a, nil
 		}
 	}
+	// 所有候选都已 Build 成功但全部 IsAvailable=false → 给出最有用的人话.
+	if len(tried) > 0 {
+		return nil, fmt.Errorf("没有可用的适配器 (尝试过: %s); 请确认对应 CLI 已 PATH 安装, 或在 config.yaml 改 default_adapter / fallback_adapters",
+			strings.Join(tried, ", "))
+	}
 	if firstErr != nil {
 		return nil, firstErr
 	}
-	return nil, fmt.Errorf("no available adapter among: %s", strings.Join(tried, ", "))
+	return nil, fmt.Errorf("没有候选适配器: 请在 config.yaml 配置 default_adapter")
 }

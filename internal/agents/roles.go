@@ -25,14 +25,26 @@ const safetyRulesForActor = `【重要安全边界, 必须严格遵守】
 4. 允许使用项目级虚拟环境 (venv / .venv / node_modules / go.mod 内依赖), 这些
    都在 <PROJECT_DIR> 之内, 不算全局变更.
 5. 严禁执行删除家目录、rm -rf /、格式化磁盘等破坏性命令.
+6. **本轮的"报告 markdown" (dev.md / test.md) 必须通过标准输出 (stdout) 完整返回**,
+   不要用 Write/Edit 等工具把这份报告写到磁盘 — aswe 调度器会自己落盘.
+   注意: 项目源代码、测试代码等"工程文件"应当照常用 Write/Edit 写到 <PROJECT_DIR> 内,
+   这条限制只针对最终的 dev.md / test.md 报告本身.
 `
 
 // safetyRulesForReader 只读 Agent (Plan/PlanReview/CodeReview) 的规则较松:
 // 只能读不能写; 不允许安装/执行项目外的命令.
+//
+// 注意: 第 4 条很重要 — 这些 Agent 的产物 (plan.md / plan-review.md / review.md / spec.md / test.md)
+// 必须通过**标准输出**返回, 让 aswe 调度器统一落盘. 如果 AI 自己用 Write/Edit/Create 工具
+// 把内容写到磁盘, stdout 往往只剩简短摘要, 后续机器校验(比如 plan.md 的 aswe-plan-modules
+// YAML 块)会因读到的是缺内容的 stdout 副本而误判失败.
 const safetyRulesForReader = `【安全边界】
 1. 你是只读角色, 仅允许**读取** <PROJECT_DIR> 下的文件, 不得创建/修改/删除任何文件.
 2. 不得安装任何依赖, 不得执行会产生副作用的命令.
 3. 所有建议以纯 markdown 文字输出; 真正的代码改动由 Dev-Agent 在下一阶段进行.
+4. **本轮的报告 (例如 plan.md / review.md / spec.md) 必须通过标准输出 (stdout) 完整返回**;
+   严禁使用 Write / Edit / Create / fs_write 等工具把内容落盘到任何位置.
+   aswe 调度器会自己把你的 stdout 内容写入对应 artifact 文件.
 `
 
 func withSafety(projectDir, rules, body string) string {
@@ -59,7 +71,7 @@ proposal.md:
 %s
 ----
 
-输出要求:
+输出要求 (**完整 markdown 必须通过 stdout 返回, 不要用 Write 工具落盘**):
 - 仅输出 markdown, 不要代码围栏.
 - 章节: "## ADDED Requirements", 每个 Requirement 使用 "### Requirement:" 小节, 并在下面列出 1~2 个 "#### Scenario:" 描述 WHEN/THEN.
 - 末尾单独一行输出: VERDICT: PASS`, proposal)
@@ -85,7 +97,9 @@ func NewPlan(cli adapter.CLIAdapter) *PlanAgent {
 
 func (a *PlanAgent) Run(ctx context.Context, in *RunInput) (*RunOutput, error) {
 	spec := in.PrevOutputs[state.StageSpec]
+	prevPlan := in.PrevOutputs[state.StagePlan] // 上一轮自己写的 plan.md, 第一次为空.
 
+	// 反馈分两块: AI 反馈 + 机器改判 (后者可能写在 plan-review.md 末尾的 "[机器改判]" 块).
 	feedbackSection := ""
 	if strings.TrimSpace(in.PlanFeedback) != "" {
 		feedbackSection = fmt.Sprintf(`
@@ -96,6 +110,17 @@ func (a *PlanAgent) Run(ctx context.Context, in *RunInput) (*RunOutput, error) {
 `, in.PlanFeedback)
 	}
 
+	// 增量修复指引: 让模型基于上一轮 plan.md 做最小化定向修改, 而不是整篇重写.
+	prevPlanSection := ""
+	if strings.TrimSpace(prevPlan) != "" {
+		prevPlanSection = fmt.Sprintf(`
+【上一轮你自己产出的 plan.md, 本轮请基于它做"最小化定向修改"——不要整篇重写, 不要丢掉已正确的内容】
+----
+%s
+----
+`, prevPlan)
+	}
+
 	body := fmt.Sprintf(`你是 Plan-Agent. 你的任务是**仅输出技术方案**, 现在还不能写代码.
 等 Plan-Review 评审通过后, Dev-Agent 才会在下一阶段真正实现.
 
@@ -103,10 +128,10 @@ spec:
 ----
 %s
 ----
-%s
+%s%s
 目标项目目录(尚未创建代码, 仅作规划锚点): %s
 
-输出要求(写入 plan.md, 仅 markdown, 不要额外代码围栏, 唯一允许的围栏是最后的 aswe-plan-modules YAML 块):
+输出要求 (**完整 plan.md 必须通过标准输出 stdout 返回**, 不要使用 Write/Edit/Create 等工具把内容落盘到任何位置 — aswe 调度器会自行接收 stdout 并写入 plan.md). 仅 markdown, 不要额外代码围栏, 唯一允许的围栏是最后的 aswe-plan-modules YAML 块):
 - "## 总体思路" : 3-5 句话说明实现思路.
 - "## 技术选型" : 语言/框架/关键依赖及理由.
 - "## 模块拆分" : 每个模块一行, 说明职责与文件位置(相对项目根).
@@ -138,16 +163,68 @@ spec:
     3. 模块之间允许依赖, 调度器会按数组顺序串行执行模块.
     4. 每个单元的 scope 应尽量不与其他单元重叠.
 - 末尾单独一行: VERDICT: PASS (方案生成本身总是 PASS, 是否可用由 Plan-Review 决定)`,
-		spec, feedbackSection, in.ProjectDir)
+		spec, prevPlanSection, feedbackSection, in.ProjectDir)
 
 	prompt := withSafety(in.ProjectDir, safetyRulesForReader, body)
 	out, raw, err := a.invokeWith(ctx, in, prompt, in.WorkspaceDir, 600)
 	if err != nil {
 		return nil, err
 	}
+	// Rescue: 部分 agentic CLI 不听话, 把完整 plan.md (含 aswe-plan-modules YAML)
+	// 用 Write 工具落到了 cwd 或 ProjectDir, 而 stdout 只回了简短摘要. 这里若 raw
+	// 缺标记, 就到那些候选路径找一份含 marker 的覆盖回 outPath, 后续校验才能命中.
+	if rescued, ok := rescueArtifactByMarker(in, out.OutputPath, "plan.md", raw, "# aswe-plan-modules"); ok {
+		raw = rescued
+	}
+	if _, err := state.ExtractPlanModules(raw); err != nil {
+		repairPrompt := withSafety(in.ProjectDir, safetyRulesForReader, buildPlanRepairPrompt(raw, err))
+		out, raw, err = a.invokeWith(ctx, in, repairPrompt, in.WorkspaceDir, 600)
+		if err != nil {
+			return nil, err
+		}
+		// 修复轮也跑一次 rescue, 防止 AI 又去用 Write
+		if rescued, ok := rescueArtifactByMarker(in, out.OutputPath, "plan.md", raw, "# aswe-plan-modules"); ok {
+			raw = rescued
+		}
+	}
 	out.Passed = true // Plan 本身总 PASS, 让 Plan-Review 来裁决
 	out.Summary = firstLines(raw, 12)
 	return out, nil
+}
+
+func buildPlanRepairPrompt(plan string, reason error) string {
+	fence := "```"
+	return fmt.Sprintf(`你是 Plan-Agent. 下面这份 plan.md 未通过机器校验, 原因是:
+%v
+
+请输出一份完整修复后的 plan.md, 保留原有技术方案内容, 但必须在末尾补上唯一的机器可读 YAML 代码块.
+
+原始 plan.md:
+----
+%s
+----
+
+强制要求:
+1. 只输出完整 markdown, 不要解释, 不要在全文外包裹代码围栏.
+2. 末尾必须包含 "## 模块与单元拆分 (机器可读)".
+3. 该章节下面必须且只能有一个 yaml fenced code block, 格式必须如下:
+
+%syaml
+# aswe-plan-modules
+modules:
+  - id: A
+    title: 模块标题
+    goal: 模块目标
+    units:
+      - id: A.1
+        title: 单元标题
+        scope: 相对项目根的文件或目录
+        deliverable: 可验证交付物
+%s
+
+4. 每个 module 必须有 id/title/units; 每个 unit 必须有 id/title/scope/deliverable.
+5. id 必须全局唯一; 每个模块至少一个 unit.
+6. 最后一行仍然输出: VERDICT: PASS`, reason, plan, fence, fence)
 }
 
 // ==================================================================
@@ -191,7 +268,7 @@ plan.md:
    - 同一模块内单元之间不得存在依赖 (Dev 会按 FIFO 并行推进).
    - scope 基本不重叠, 避免多个单元改同一文件打架.
 
-输出要求(markdown, 写入 plan-review.md):
+输出要求 (**markdown 必须通过 stdout 返回**, 不要用 Write 等工具落盘 plan-review.md):
 - "## 结论" : 一句话说明是否通过方案评审.
 - "## 放行门槛" : 用 STATUS: READY 或 STATUS: NEEDS_MORE_WORK 表明方案是否真的可进入 Dev; 若仍有阻塞缺口, 必须列出 MISSING: 清单.
 - "## 逐项评估" : 对上面 7 点逐一作答, 形式: "N. 标题 — ✅/❌ 说明".
@@ -280,7 +357,7 @@ plan.md (已通过 Plan-Review 的实施方案, 应严格遵循):
 4. 新增依赖必须写进项目级依赖清单 (requirements.txt / package.json / go.mod), 不要 sudo 或全局安装.
 5. 所有文件路径必须在 %s 之内.
 
-输出要求(这是你给编排系统的答复, 写入 dev.md):
+输出要求 (**这是你给编排系统的答复, 完整 markdown 必须通过 stdout 返回**, 不要把 dev.md 这份"报告本身"用 Write 落盘 — aswe 会自行接收 stdout 并写入 dev.md; 但项目源代码、测试代码等"工程文件"应当照常用 Write 写入 ProjectDir):
 - "## 实现摘要" : 简述本轮做了什么.
 - "## 变更文件清单" : 列出你实际创建或修改的文件, 格式 "- path/to/file — 说明".
 - "## 与 plan 的偏差" : 若有偏离 plan 之处, 逐条说明并给出理由; 没有就写"无".
@@ -343,7 +420,7 @@ Dev 交付报告 (dev.md):
 %s
 ----
 
-输出要求(markdown, 写入 review.md):
+输出要求 (**markdown 必须通过 stdout 返回**, 不要用 Write 等工具落盘 review.md):
 - "## 结论" : 一句话是否通过.
 - "## 对 Spec 的覆盖" : 列出 spec 每个 Requirement, 标注 ✅/❌, 并引用对应代码位置 (文件:行号 或 文件:函数).
 - "## 对 Plan 的符合度" : 是否按照 plan 的模块拆分与接口实现; 偏差是否合理.
@@ -450,7 +527,7 @@ Dev 交付报告:
 2. 把执行的**真实输出片段**贴进 test.md (至少包含命令本身和关键返回).
 3. 若因为环境限制无法执行某一步, 如实写明, 不要编造输出.
 
-输出要求(写入 test.md):
+输出要求 (**markdown 必须通过 stdout 返回**, 不要用 Write 等工具落盘 test.md):
 - "## 项目类型识别" : 一句话说明本次判定的项目类型, 以及据此选择的验证策略.
 - "## 测试环境准备" : 列出你实际执行的准备命令及其结果 (没有则写"无").
 - "## 执行的验证命令" : 每条命令一行.
@@ -479,6 +556,11 @@ Dev 交付报告:
 // ==================================================================
 
 // listProjectTree 返回相对 ProjectDir 的文件树字符串, 仅用于 prompt 上下文.
+// maxProjectTreeEntries 每次注入到 prompt 的目录条目上限.
+// 1500 条对应大约 60~150KB 的纯文本, 已经能让模型看清结构, 又不会撑爆 prompt.
+// 老项目走到这里通常是 node_modules 没忽略干净 / 有大数据集, 截断比塞爆更合适.
+const maxProjectTreeEntries = 1500
+
 func listProjectTree(root string, maxDepth int) string {
 	if root == "" {
 		return "(未配置 ProjectDir)"
@@ -492,6 +574,7 @@ func listProjectTree(root string, maxDepth int) string {
 		dir bool
 	}
 	var entries []entry
+	truncated := false
 	skipDir := map[string]bool{
 		"node_modules": true, ".git": true, ".venv": true, "venv": true,
 		"__pycache__": true, "dist": true, "build": true, ".next": true, "target": true,
@@ -515,6 +598,10 @@ func listProjectTree(root string, maxDepth int) string {
 		if info.IsDir() && (skipDir[base] || strings.HasPrefix(base, ".")) {
 			return filepath.SkipDir
 		}
+		if len(entries) >= maxProjectTreeEntries {
+			truncated = true
+			return filepath.SkipDir
+		}
 		entries = append(entries, entry{rel: rel, dir: info.IsDir()})
 		return nil
 	})
@@ -529,6 +616,10 @@ func listProjectTree(root string, maxDepth int) string {
 			suffix = "/"
 		}
 		fmt.Fprintf(&b, "%s%s\n", e.rel, suffix)
+	}
+	if truncated {
+		fmt.Fprintf(&b, "\n... (目录过大, 仅展示前 %d 条; 完整结构请用 ls/tree 查看)\n",
+			maxProjectTreeEntries)
 	}
 	return b.String()
 }

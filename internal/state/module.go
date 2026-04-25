@@ -166,7 +166,27 @@ func WriteTasksMD(changeDir string, st *State) error {
 	fmt.Fprintf(&b, "_generated at %s_\n\n", time.Now().Format(time.RFC3339))
 
 	if len(st.Modules) == 0 {
-		b.WriteString("> 尚未进入 plan 阶段, 或 plan 未产出模块拆分.\n")
+		// 没有模块时退化为线性 stage 视图: 让用户在 plan 之前/线性兜底路径下也能看到进度.
+		b.WriteString("> 暂无模块拆分 (仍在 spec/plan 之前, 或运行在线性兜底路径).\n\n")
+		b.WriteString("## Stage 概览\n\n")
+		b.WriteString("| Stage | 状态 | Adapter | Summary |\n")
+		b.WriteString("|-------|------|---------|---------|\n")
+		stages := []Stage{
+			StageSpec, StagePlan, StagePlanReview,
+			StageDev, StageReview, StageTest,
+		}
+		for _, s := range stages {
+			n, ok := st.Nodes[s]
+			if !ok || n == nil {
+				fmt.Fprintf(&b, "| %s | _未运行_ |  |  |\n", s)
+				continue
+			}
+			fmt.Fprintf(&b, "| %s | %s | %s | %s |\n",
+				s, n.Status, n.Adapter, escapeMD(truncate(n.Summary, 80)))
+		}
+		b.WriteString("\n")
+		fmt.Fprintf(&b, "当前 stage: **%s**, plan iter=%d, code iter=%d\n",
+			st.CurrentStage, st.PlanIteration, st.CodeIteration)
 		return os.WriteFile(filepath.Join(changeDir, "tasks.md"), []byte(b.String()), 0o644)
 	}
 
@@ -293,9 +313,14 @@ func escapeMD(s string) string {
 	return s
 }
 
+// truncate 按 rune 截断字符串, 中英混合字符串不会切到多字节字符中段.
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	if n <= 0 {
+		return ""
+	}
+	rs := []rune(s)
+	if len(rs) <= n {
 		return s
 	}
-	return s[:n] + "…"
+	return string(rs[:n]) + "…"
 }

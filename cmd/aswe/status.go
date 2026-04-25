@@ -27,7 +27,7 @@ func runStatus(changeID string) error {
 	if err != nil {
 		return err
 	}
-	store, err := state.Open(workspace, changeID)
+	store, err := state.OpenReadOnly(workspace, changeID)
 	if err != nil {
 		return err
 	}

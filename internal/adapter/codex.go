@@ -36,9 +36,18 @@ func (a *CodexAdapter) Invoke(ctx context.Context, req Request) (*Response, erro
 	if len(req.ExtraArgs) > 0 {
 		args = append(args, req.ExtraArgs...)
 	}
-	args = append(args, req.Prompt)
+	// 大 prompt 切 stdin, 防止超 ARG_MAX.
+	stdinPayload := ""
+	if len(req.Prompt) > maxArgvPromptBytes {
+		stdinPayload = req.Prompt
+		// codex exec 需要至少一个 prompt 占位, 不带任何位置参数会进交互模式;
+		// 用 "-" 约定 "从 stdin 读" 是大多数 *nix 工具的通用语义, codex 也兼容.
+		args = append(args, "-")
+	} else {
+		args = append(args, req.Prompt)
+	}
 
-	stdout, stderr, exit, err := runCommand(ctx, req.WorkDir, req.TimeoutSeconds, "", a.Binary, args...)
+	stdout, stderr, exit, err := runCommand(ctx, req.WorkDir, req.TimeoutSeconds, stdinPayload, a.Binary, args...)
 	if err != nil && exit == 0 {
 		return nil, fmt.Errorf("codex invoke failed: %w (stderr=%s)", err, stderr)
 	}
