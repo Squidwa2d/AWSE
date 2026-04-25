@@ -1,0 +1,49 @@
+# ASWE 运行时配置
+# 三种自动化模式: auto / interactive / step
+automation_mode: interactive
+
+# PM-Agent 的主对话大脑
+pm_agent:
+  adapter: codebuddy        # 优先可用: codebuddy / claude-code / codex / generic
+  fallback: [claude-code, codex]
+  model: ""                 # 留空则使用工具默认模型
+  max_turns: 8              # 最大追问轮数
+
+# 各研发 Agent 使用的适配器
+agents:
+  spec:
+    adapter: codebuddy
+    fallback: [claude-code, codex]
+  plan:
+    adapter: codebuddy
+    fallback: [claude-code, codex]
+  plan-review:
+    adapter: codebuddy
+    fallback: [claude-code, codex]
+  dev:
+    adapter: codebuddy
+    fallback: [claude-code, codex]
+  review:
+    adapter: codebuddy
+    fallback: [claude-code, codex]
+  test:
+    adapter: codebuddy
+    fallback: [claude-code, codex]
+
+# 循环上限
+# plan<->plan-review 独立计数; dev<->review<->test 共享计数.
+max_plan_loops: 8
+max_code_loops: 8
+
+# 通用适配器(generic)的命令模板。占位符:
+#   {{PROMPT_FILE}}  一次性提示词文件路径
+#   {{WORK_DIR}}     工作目录
+# 例: command: "my-ai --prompt-file {{PROMPT_FILE}} --cwd {{WORK_DIR}}"
+generic:
+  command: ""
+
+# OpenSpec 目录(相对于 workspace_root)
+openspec_dir: openspec
+
+# 工作区根目录. 留空则自动探测(寻找含 openspec/ 的上级目录)
+workspace_root: ""
