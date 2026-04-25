@@ -50,6 +50,10 @@ type Config struct {
 	WorkspaceRoot  string                 `yaml:"workspace_root"`
 	// MaxPlanLoops plan<->plan-review 的自动循环上限, 0 使用默认 8.
 	MaxPlanLoops int `yaml:"max_plan_loops"`
+	// MinPlanLoops plan<->plan-review 至少要完成的循环数(从 1 起).
+	// 即便第一轮 Plan-Review 判 PASS, 未达此数也会被强制降级为 FAIL 再跑一轮,
+	// 防止 AI "一眼通过" 草率放行. 0 使用默认 2.
+	MinPlanLoops int `yaml:"min_plan_loops"`
 	// MaxCodeLoops dev<->review<->test 共享的自动循环上限, 0 使用默认 8.
 	MaxCodeLoops int `yaml:"max_code_loops"`
 }
@@ -74,6 +78,7 @@ func Default() *Config {
 		},
 		OpenSpecDir:  "openspec",
 		MaxPlanLoops: 8,
+		MinPlanLoops: 2,
 		MaxCodeLoops: 8,
 	}
 }
@@ -111,6 +116,12 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.MaxPlanLoops <= 0 {
 		cfg.MaxPlanLoops = 8
+	}
+	if cfg.MinPlanLoops <= 0 {
+		cfg.MinPlanLoops = 2
+	}
+	if cfg.MinPlanLoops > cfg.MaxPlanLoops {
+		cfg.MinPlanLoops = cfg.MaxPlanLoops
 	}
 	if cfg.MaxCodeLoops <= 0 {
 		cfg.MaxCodeLoops = 8

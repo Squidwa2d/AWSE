@@ -152,6 +152,7 @@ func runRun(cmd *cobra.Command, changeID string, rf *runFlags) error {
 		Mode:         cfg.AutomationMode,
 		ProjectDir:   projectDir,
 		MaxPlanLoops: cfg.MaxPlanLoops,
+		MinPlanLoops: cfg.MinPlanLoops,
 		MaxCodeLoops: cfg.MaxCodeLoops,
 		DevUnit:      agents.NewDevUnit(devCLI),
 		ReviewUnit:   agents.NewReviewUnit(reviewCLI),

@@ -30,13 +30,16 @@ type unitAgents struct {
 func (o *Orchestrator) runModulePipeline(ctx context.Context, changeDir string, ua *unitAgents) (bool, error) {
 	st := o.store.State()
 
-	// 若 state 里还没有模块, 尝试从 plan.md 解析
+	// 若 state 里还没有模块, 尝试从 plan.md 解析.
+	// 注意: transition() 已在 plan-review PASS 时用 validatePlanModules 做过机器兜底,
+	// 正常路径下此处必能解析成功. 真的失败通常意味着 state 被外部改过,
+	// 此时直接返回 error 交给人工处理, 而不是静默降级到线性流水线.
 	if len(st.Modules) == 0 {
 		planMD := readNodeOutputAt(changeDir, state.StagePlan)
 		mods, err := state.ExtractPlanModules(planMD)
 		if err != nil {
-			fmt.Fprintf(o.out, "ℹ️  plan.md 未提供机器可读模块拆分 (%v), 回退到线性流水线\n", err)
-			return false, nil
+			fmt.Fprintf(o.out, "🛑 plan.md 未通过机器校验 (%v); Plan-Review 的兜底校验可能被绕过, 请重跑 plan 阶段.\n", err)
+			return true, fmt.Errorf("plan.md modules YAML missing or invalid: %w", err)
 		}
 		st.Modules = mods
 		if st.MaxUnitLoops <= 0 {

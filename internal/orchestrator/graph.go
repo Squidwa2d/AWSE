@@ -36,8 +36,9 @@ import (
 
 // 默认循环上限.
 const (
-	DefaultPlanLoops = 8
-	DefaultCodeLoops = 8
+	DefaultPlanLoops    = 8
+	DefaultCodeLoops    = 8
+	DefaultMinPlanLoops = 2 // plan<->plan-review 至少跑多少轮
 )
 
 // Orchestrator 编排器.
@@ -48,6 +49,7 @@ type Orchestrator struct {
 	mode         config.AutomationMode
 	keyNodes     map[state.Stage]bool
 	maxPlanLoops int
+	minPlanLoops int // plan<->plan-review 最小循环数, 即便 AI 第一轮判 PASS 也强制再跑
 	maxCodeLoops int
 	projectDir   string
 
@@ -65,6 +67,7 @@ type Options struct {
 	Mode         config.AutomationMode
 	ProjectDir   string
 	MaxPlanLoops int // 0 则使用默认 8
+	MinPlanLoops int // 0 则使用默认 2
 	MaxCodeLoops int // 0 则使用默认 8
 	// 单元化 Agent; 可选. 传入后启用模块化流水线.
 	DevUnit    *agents.DevUnitAgent
@@ -88,6 +91,12 @@ func New(opts Options) *Orchestrator {
 	if opts.MaxPlanLoops <= 0 {
 		opts.MaxPlanLoops = DefaultPlanLoops
 	}
+	if opts.MinPlanLoops <= 0 {
+		opts.MinPlanLoops = DefaultMinPlanLoops
+	}
+	if opts.MinPlanLoops > opts.MaxPlanLoops {
+		opts.MinPlanLoops = opts.MaxPlanLoops
+	}
 	if opts.MaxCodeLoops <= 0 {
 		opts.MaxCodeLoops = DefaultCodeLoops
 	}
@@ -102,6 +111,7 @@ func New(opts Options) *Orchestrator {
 			state.StageDev:  true,
 		},
 		maxPlanLoops: opts.MaxPlanLoops,
+		minPlanLoops: opts.MinPlanLoops,
 		maxCodeLoops: opts.MaxCodeLoops,
 		projectDir:   opts.ProjectDir,
 		in:           bufio.NewReader(opts.In),
@@ -259,12 +269,40 @@ func (o *Orchestrator) Run(ctx context.Context, changeDir, proposalPath string) 
 }
 
 // transition 决定下一个节点. 核心逻辑:
+//   - plan-review PASS 但未达 MinPlanLoops → 降级为 FAIL, 回 plan 再跑 (避免 AI 一眼放行)
+//   - plan-review PASS 且 plan.md 缺少合法的 aswe-plan-modules YAML → 同样降级 FAIL
 //   - plan-review FAIL → 回 plan (+计数); 达上限 → failed
 //   - review/test FAIL → 回 dev (+计数); 达上限 → failed
 //   - 其它节点走静态边.
 func (o *Orchestrator) transition(st *state.State, cur state.Stage, out *agents.RunOutput, changeDir string) state.Stage {
 	switch cur {
 	case state.StagePlanReview:
+		// 机器侧强校验: YAML 必须存在且合法, 否则不管 AI 怎么说都视为 FAIL.
+		planMD := readNodeOutputAt(changeDir, state.StagePlan)
+		yamlErr := validatePlanModules(planMD)
+		// 最小轮数兵底: 第一轮(PlanIteration=0) 总算已完成 1 轮, 若 minPlanLoops=2
+		// 则仅完成轮数 < 2 时要强制再跑; 仅在 AI 已判 PASS 且机校通过时才生效,
+		// 避免 FAIL 路径重复加计数.
+		completed := st.PlanIteration + 1
+		if out.Passed && yamlErr == nil && completed < o.minPlanLoops {
+			fmt.Fprintf(o.out, "ℹ️  plan<->plan-review 最小轮数未达 %d (已完成 %d), 强制再跑一轮以加深打磨\n",
+				o.minPlanLoops, completed)
+			out.Passed = false
+			appendPlanReviewOverride(changeDir,
+				fmt.Sprintf("本轮已完成 %d/%d 轮, 尚未达到最小轮数, 调度器强制再跑一轮以加深打磨. "+
+					"请 Plan-Agent 针对本次评审意见进一步细化: 模块拆分必须有明确依赖关系、"+
+					"每个单元的 scope/deliverable 必须可独立验收、验收标准可衡量.",
+					completed, o.minPlanLoops))
+		}
+		// 机校不过关 → 撤销 AI 的 PASS
+		if out.Passed && yamlErr != nil {
+			fmt.Fprintf(o.out, "⚠️  plan.md 缺少/不合法 aswe-plan-modules YAML (%v), 撤销本轮 PASS\n", yamlErr)
+			out.Passed = false
+			appendPlanReviewOverride(changeDir, fmt.Sprintf(
+				"机器校验失败: plan.md 未提供合法的 `# aswe-plan-modules` YAML 代码块.\n"+
+					"请 Plan-Agent 下一轮在 plan.md 末尾补上符合规范的 YAML 块, 原因: %v", yamlErr))
+		}
+
 		if out.Passed {
 			st.PlanFeedback = ""
 			fmt.Fprintln(o.out, "✅ 方案评审通过, 进入代码实现阶段")

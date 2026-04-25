@@ -33,6 +33,9 @@ agents:
 # 循环上限
 # plan<->plan-review 独立计数; dev<->review<->test 共享计数.
 max_plan_loops: 8
+# plan<->plan-review 最小循环数: 即便第一轮 Plan-Review 自报 PASS, 未达此数也会被
+# 强制改判 FAIL 再跑一轮, 防止 AI "一眼放行". 默认 2.
+min_plan_loops: 2
 max_code_loops: 8
 
 # 通用适配器(generic)的命令模板。占位符:

@@ -4,7 +4,7 @@
 
 核心特性:
 - **PM-Agent 多轮澄清**: 至少 3 轮追问, 把模糊需求落成 `proposal.md`.
-- **方案先行 + 严格评审**: `plan → plan-review` 独立循环最多 8 轮, 方案不过关不写代码; Plan-Review 同时校验方案里嵌入的 `aswe-plan-modules` YAML 拆分是否合理.
+- **方案先行 + 双重兵底**: `plan → plan-review` 独立循环至少 2 轮、最多 8 轮, 方案不过关不写代码. Plan-Review 结束后调度器再在机器侧确认 `plan.md` 嵌入的 `aswe-plan-modules` YAML 的存在与合法性, 避免 AI 一眼放行.
 - **模块化流水线**: 方案通过后, 按 Plan-Agent 拆分的 Module/Unit 调度 `dev → review → test`; 模块之间串行, 模块内单元 FIFO 流水线, 每个单元独立 8 轮上限, 超限暂停等人工介入.
 - **安全边界**: Dev/Test 子进程仅允许在 `projects/<change-id>/` 内读写; 涉及全局安装/sudo 时必须显式声明 `NEEDS_HUMAN_APPROVAL:` 停下来等人确认.
 - **真跑测试, 按项目类型分流**: Test-Agent 会根据 `go.mod` / `package.json` / `requirements.txt` / 纯静态前端 等自动切换验证策略, 不会强行给静态站点装 vitest 这类重型框架.
@@ -96,8 +96,9 @@ agents:                           # 每个角色可单独指定 adapter / fallba
   review:      { adapter: codebuddy, fallback: [claude-code, codex] }
   test:        { adapter: codebuddy, fallback: [claude-code, codex] }
 
-# 循环上限 (plan↔plan-review 独立计数; dev↔review↔test 共享计数)
+# 循环上下限 (plan↔plan-review 独立计数; dev↔review↔test 共享计数)
 max_plan_loops: 8
+min_plan_loops: 2                 # plan<->plan-review 至少完成几轮 (未达即便 PASS 也强制改判 FAIL)
 max_code_loops: 8                 # 未启用模块化流水线时才生效; 启用模块化后每单元也是 8 轮
 
 # 通用适配器, 用来接入未内建支持的 AI CLI. 占位符:
